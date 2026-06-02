@@ -1,0 +1,542 @@
+import { useEffect, useMemo, useState, type ReactNode } from "react";
+import {
+  Activity,
+  AlertOctagon,
+  ArrowRight,
+  BarChart3,
+  CheckCircle2,
+  Clock,
+  Download,
+  RefreshCw,
+  TrendingUp,
+  Upload,
+  XCircle,
+  Trophy,
+} from "lucide-react";
+import {
+  Bar,
+  BarChart,
+  CartesianGrid,
+  Legend,
+  Line,
+  LineChart,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from "recharts";
+import { cn } from "@/lib/utils";
+import { getSheetSourceSummary } from "@/lib/google-sheet-sync";
+import { useQC, type DeviceRow, type DeviceStatus } from "@/lib/qc-store";
+import { QCFilter, filterDevices, type QCFilterState } from "./QCFilter";
+
+const STATUS_COLOR: Record<DeviceStatus, string> = {
+  Approved: "text-success",
+  Rejected: "text-destructive",
+  Pending: "text-warning",
+  "In Progress": "text-info",
+};
+
+const STATUS_BG: Record<DeviceStatus, string> = {
+  Approved: "bg-success/10 text-success border-success/30",
+  Rejected: "bg-destructive/10 text-destructive border-destructive/30",
+  Pending: "bg-warning/10 text-warning border-warning/30",
+  "In Progress": "bg-info/10 text-info border-info/30",
+};
+
+export function QCDashboard({ onNewInspection }: { onNewInspection: () => void }) {
+  const liveDevices = useQC((s) => s.devices);
+  const sheetSync = useQC((s) => s.sheetSync);
+  const [now, setNow] = useState(Date.now());
+  const [filterState, setFilterState] = useState<QCFilterState>({
+    timeRange: "24h",
+    versions: [],
+  });
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  const availableVersions = useMemo(() => {
+    const versions = new Set<string>();
+    liveDevices.forEach((d) => {
+      if (d.version) versions.add(d.version);
+    });
+    return Array.from(versions).sort();
+  }, [liveDevices]);
+
+  const filteredDevices = useMemo(
+    () => [...filterDevices(liveDevices, filterState)].sort((a, b) => tsOf(b) - tsOf(a)),
+    [liveDevices, filterState]
+  );
+
+  const stats = useMemo(() => {
+    const total = liveDevices.length;
+    const approved = liveDevices.filter((d) => d.status === "Approved").length;
+    const rejected = liveDevices.filter((d) => d.status === "Rejected").length;
+    const pending = liveDevices.filter((d) => d.status === "Pending").length;
+    const inProgress = liveDevices.filter((d) => d.status === "In Progress").length;
+    const open = total - approved - rejected;
+    const durations = liveDevices.map((d) => durationOf(d, now)).filter((ms) => ms > 0);
+    const avg = durations.length ? durations.reduce((sum, ms) => sum + ms, 0) / durations.length : 0;
+    const best = durations.length ? Math.min(...durations) : 0;
+    const yieldPct = total ? (approved / total) * 100 : 0;
+    return { total, approved, rejected, pending, inProgress, open, avg, best, yieldPct };
+  }, [liveDevices, now]);
+
+  const byPhase = useMemo(() => {
+    const phase = (t: "Pre" | "Post") => {
+      const list = liveDevices.filter((d) => d.qcType === t);
+      const approved = list.filter((d) => d.status === "Approved").length;
+      const rejected = list.filter((d) => d.status === "Rejected").length;
+      const open = list.length - approved - rejected;
+      const durations = list.map((d) => durationOf(d, now)).filter((ms) => ms > 0);
+      const avgMs = durations.length ? durations.reduce((sum, ms) => sum + ms, 0) / durations.length : 0;
+      return { count: list.length, approved, rejected, open, avgMs };
+    };
+
+    return { Pre: phase("Pre"), Post: phase("Post") };
+  }, [liveDevices, now]);
+
+  const issueReasons = useMemo(() => {
+    const counts = new Map<string, number>();
+    liveDevices.forEach((device) => {
+      if (device.status !== "Rejected") return;
+      const reason = (device.rejectionReason || device.remarks || "Unspecified").trim() || "Unspecified";
+      counts.set(reason, (counts.get(reason) ?? 0) + 1);
+    });
+
+    return Array.from(counts.entries())
+      .map(([reason, count]) => ({ reason, count }))
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 5);
+  }, [liveDevices]);
+
+  const inspectorStats = useMemo(() => {
+    const map = new Map<
+      string,
+      { id: string; name: string; total: number; approved: number; rejected: number; avgMs: number }
+    >();
+
+    liveDevices.forEach((device) => {
+      const inspectorId = device.inspectorId || "Unassigned";
+      const current = map.get(inspectorId) ?? {
+        id: inspectorId,
+        name: inspectorId,
+        total: 0,
+        approved: 0,
+        rejected: 0,
+        avgMs: 0,
+      };
+
+      current.total += 1;
+      if (device.status === "Approved") current.approved += 1;
+      if (device.status === "Rejected") current.rejected += 1;
+      current.avgMs += durationOf(device, now);
+      map.set(inspectorId, current);
+    });
+
+    return Array.from(map.values())
+      .map((item) => ({
+        ...item,
+        avgMs: item.total ? item.avgMs / item.total : 0,
+        yieldPct: item.total ? (item.approved / item.total) * 100 : 0,
+      }))
+      .sort((a, b) => (a.avgMs || 999) - (b.avgMs || 999));
+  }, [liveDevices, now]);
+
+  const hourly = useMemo(() => {
+    const buckets: Record<string, { hour: string; pre: number; post: number; open: number }> = {};
+    for (let hour = 0; hour < 24; hour++) {
+      const key = `${hour.toString().padStart(2, "0")}h`;
+      buckets[key] = { hour: key, pre: 0, post: 0, open: 0 };
+    }
+
+    liveDevices.forEach((device) => {
+      const ts = device.actionAt ?? device.endTime ?? device.startTime;
+      if (!ts) return;
+      const key = `${new Date(ts).getHours().toString().padStart(2, "0")}h`;
+      const bucket = buckets[key] ?? { hour: key, pre: 0, post: 0, open: 0 };
+      if (device.qcType === "Pre") bucket.pre += 1;
+      if (device.qcType === "Post") bucket.post += 1;
+      if (device.status === "Pending" || device.status === "In Progress") bucket.open += 1;
+      buckets[key] = bucket;
+    });
+
+    return Object.values(buckets);
+  }, [liveDevices]);
+
+  const recent = useMemo(
+    () => [...liveDevices].sort((a, b) => tsOf(b) - tsOf(a)).slice(0, 8),
+    [liveDevices]
+  );
+
+  return (
+    <div className="mx-auto max-w-[1400px] space-y-6 px-6 py-8">
+      <div className="flex flex-wrap items-end justify-between gap-4">
+        <div>
+          <div className="label-mono">
+            Operations Overview · Today · {new Date().toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" })}
+          </div>
+          <h1 className="mt-1 text-3xl font-semibold tracking-tight">QC Dashboard</h1>
+        </div>
+        <div className="flex items-center gap-2">
+          <QCFilter state={filterState} onChange={setFilterState} availableVersions={availableVersions} />
+          <button
+            onClick={onNewInspection}
+            className="group inline-flex items-center gap-2 rounded-lg bg-primary px-4 py-2.5 text-sm font-medium text-primary-foreground shadow-sm transition hover:opacity-90"
+          >
+            New Inspection
+            <ArrowRight className="h-4 w-4 transition-transform group-hover:translate-x-0.5" />
+          </button>
+        </div>
+
+      <div className="grid gap-3 md:grid-cols-3">
+        <div className="surface p-4">
+          <div className="label-mono">Live source</div>
+          <div className="mt-1 text-sm font-medium">{getSheetSourceSummary()}</div>
+          <div className="mt-1 text-xs text-muted-foreground">Apps Script endpoint driving queue data</div>
+        </div>
+        <div className="surface p-4">
+          <div className="label-mono">Live rows</div>
+          <div className="mt-1 stat-num text-info">{stats.total.toString().padStart(2, "0")}</div>
+          <div className="mt-1 text-xs text-muted-foreground">
+            {stats.approved} approved · {stats.rejected} rejected · {stats.open} open
+          </div>
+        </div>
+        <div className="surface p-4">
+          <div className="label-mono">Sync status</div>
+          <div className={cn("mt-1 text-sm font-medium", sheetSync.syncing ? "text-warning" : "text-success")}>
+            {sheetSync.syncing ? "Syncing now" : "Ready"}
+          </div>
+          <div className="mt-1 text-xs text-muted-foreground">
+            {sheetSync.lastSyncAt ? `Last sync ${new Date(sheetSync.lastSyncAt).toLocaleTimeString()}` : "No sync yet"}
+          </div>
+        </div>
+      </div>
+
+      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
+        <StatCard label="Total Live" value={stats.total} icon={<Activity className="h-4 w-4" />} note="Rows from Apps Script" />
+        <StatCard label="Approved" value={stats.approved} icon={<CheckCircle2 className="h-4 w-4 text-success" />} note={`${stats.yieldPct.toFixed(1)}% yield`} valueClass="text-success" />
+        <StatCard label="Rejected" value={stats.rejected} icon={<XCircle className="h-4 w-4 text-destructive" />} note="Manual / auto" valueClass="text-destructive" />
+        <StatCard label="Open Queue" value={stats.open} icon={<RefreshCw className="h-4 w-4 text-warning" />} note="Pending + in progress" valueClass="text-warning" />
+        <StatCard label="Avg Time" value={`${Math.round(stats.avg / 1000)}s`} icon={<Clock className="h-4 w-4 text-info" />} note={`Best ${stats.best ? `${Math.round(stats.best / 1000)}s` : "—"}`} valueClass="text-info" />
+      </div>
+
+      <div className="grid gap-4 lg:grid-cols-3">
+        <PhaseCard title="Pre-QC" subtitle="Incoming inspection" icon={<Download className="h-4 w-4 text-info" />} stats={byPhase.Pre} />
+        <PhaseCard title="Post-QC" subtitle="Final / outgoing inspection" icon={<Upload className="h-4 w-4 text-success" />} stats={byPhase.Post} />
+        <div className="surface p-5">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <BarChart3 className="h-4 w-4 text-info" />
+              <h3 className="font-semibold">Pre vs Post · Live Queue</h3>
+            </div>
+            <span className="label-mono">now</span>
+          </div>
+          <div className="mt-4 h-44">
+            <ResponsiveContainer width="100%" height="100%">
+              <BarChart
+                data={[
+                  { phase: "Pre-QC", Approved: byPhase.Pre.approved, Open: byPhase.Pre.open, Rejected: byPhase.Pre.rejected },
+                  { phase: "Post-QC", Approved: byPhase.Post.approved, Open: byPhase.Post.open, Rejected: byPhase.Post.rejected },
+                ]}
+              >
+                <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" vertical={false} />
+                <XAxis dataKey="phase" tick={{ fontSize: 11, fill: "hsl(var(--muted-foreground))" }} axisLine={false} tickLine={false} />
+                <YAxis tick={{ fontSize: 11, fill: "hsl(var(--muted-foreground))" }} axisLine={false} tickLine={false} allowDecimals={false} />
+                <Tooltip contentStyle={{ borderRadius: 8, fontSize: 12, border: "1px solid hsl(var(--border))" }} />
+                <Legend iconSize={8} wrapperStyle={{ fontSize: 11 }} />
+                <Bar dataKey="Approved" stackId="a" fill="hsl(var(--success))" radius={[0, 0, 0, 0]} />
+                <Bar dataKey="Open" stackId="a" fill="hsl(var(--warning))" />
+                <Bar dataKey="Rejected" stackId="a" fill="hsl(var(--destructive))" radius={[4, 4, 0, 0]} />
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+        </div>
+      </div>
+
+      <div className="surface p-5">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <TrendingUp className="h-4 w-4 text-info" />
+            <h3 className="font-semibold">Hourly Throughput · Live Queue</h3>
+          </div>
+          <span className="label-mono">today</span>
+        </div>
+        <div className="mt-4 h-56">
+          <ResponsiveContainer width="100%" height="100%">
+            <LineChart data={hourly}>
+              <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" vertical={false} />
+              <XAxis dataKey="hour" tick={{ fontSize: 11, fill: "hsl(var(--muted-foreground))" }} axisLine={false} tickLine={false} />
+              <YAxis tick={{ fontSize: 11, fill: "hsl(var(--muted-foreground))" }} axisLine={false} tickLine={false} allowDecimals={false} />
+              <Tooltip contentStyle={{ borderRadius: 8, fontSize: 12, border: "1px solid hsl(var(--border))" }} />
+              <Legend iconSize={8} wrapperStyle={{ fontSize: 11 }} />
+              <Line type="monotone" dataKey="pre" stroke="hsl(var(--info))" strokeWidth={2} dot={{ r: 3 }} name="Pre" />
+              <Line type="monotone" dataKey="post" stroke="hsl(var(--success))" strokeWidth={2} dot={{ r: 3 }} name="Post" />
+              <Line type="monotone" dataKey="open" stroke="hsl(var(--warning))" strokeWidth={2} dot={{ r: 3 }} name="Open" />
+            </LineChart>
+          </ResponsiveContainer>
+        </div>
+      </div>
+
+      <div className="grid gap-4 lg:grid-cols-2">
+        <div className="surface p-5">
+          <div className="flex items-center justify-between">
+            <h3 className="font-semibold">Top Rejection Reasons</h3>
+            <span className="label-mono">live</span>
+          </div>
+          <div className="mt-4 space-y-3">
+            {issueReasons.length > 0 ? (
+              issueReasons.map((reason) => {
+                const max = issueReasons[0]?.count ?? 1;
+                return (
+                  <div key={reason.reason}>
+                    <div className="flex items-center gap-2 text-sm">
+                      <AlertOctagon className="h-3.5 w-3.5 text-destructive" />
+                      <span className="font-medium">{reason.reason}</span>
+                      <span className="ml-auto font-mono tabular-nums">{reason.count}</span>
+                    </div>
+                    <div className="mt-1.5 h-1.5 w-full overflow-hidden rounded-full bg-muted">
+                      <div className="h-full rounded-full bg-destructive" style={{ width: `${(reason.count / max) * 100}%` }} />
+                    </div>
+                  </div>
+                );
+              })
+            ) : (
+              <div className="text-sm text-muted-foreground">No rejected rows yet.</div>
+            )}
+          </div>
+        </div>
+
+        <div className="surface p-5">
+          <div className="flex items-center justify-between">
+            <h3 className="font-semibold">Throughput Yield</h3>
+            <span className="label-mono inline-flex items-center gap-1 text-success">
+              <TrendingUp className="h-3 w-3" /> Live
+            </span>
+          </div>
+          <div className="mt-4 grid grid-cols-3 items-center gap-4">
+            <div>
+              <div className="stat-num">{stats.yieldPct.toFixed(0)}%</div>
+              <div className="label-mono mt-1">First-pass yield</div>
+            </div>
+            <div className="col-span-2 space-y-3">
+              <YieldBar label="Approved" value={stats.approved} max={stats.total} color="bg-success" />
+              <YieldBar label="Open" value={stats.open} max={stats.total} color="bg-warning" />
+              <YieldBar label="Rejected" value={stats.rejected} max={stats.total} color="bg-destructive" />
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div className="surface p-5">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <Trophy className="h-4 w-4 text-warning" />
+            <h3 className="font-semibold">Inspector Comparison</h3>
+          </div>
+          <span className="label-mono">live queue</span>
+        </div>
+        <div className="mt-4 divide-y divide-border">
+          {inspectorStats.length > 0 ? (
+            inspectorStats.map((insp, index) => {
+              const maxAvg = Math.max(...inspectorStats.map((x) => x.avgMs || 0), 30_000);
+              const isFastest = index === 0 && insp.avgMs > 0;
+              const idle = insp.total === 0;
+              return (
+                <div key={insp.id} className="flex items-center gap-4 py-3">
+                  <Avatar name={insp.name} highlighted={isFastest} />
+                  <div className="min-w-[160px]">
+                    <div className="flex items-center gap-2">
+                      <span className={cn("font-medium", idle && "text-muted-foreground")}>{insp.name}</span>
+                      {isFastest && <span className="label-mono text-info">fastest</span>}
+                    </div>
+                    <div className="label-mono">{insp.id}</div>
+                  </div>
+                  <div className="flex-1">
+                    <div className="h-1.5 w-full overflow-hidden rounded-full bg-muted">
+                      <div
+                        className={cn("h-full rounded-full", isFastest ? "bg-info" : "bg-primary/40")}
+                        style={{ width: insp.avgMs ? `${(insp.avgMs / maxAvg) * 100}%` : "0%" }}
+                      />
+                    </div>
+                  </div>
+                  <div className="w-28 text-right">
+                    <div className="font-mono text-lg tabular-nums">{insp.avgMs ? `${Math.round(insp.avgMs / 1000)}s` : "—"}</div>
+                    <div className="label-mono">avg / row</div>
+                  </div>
+                  <div className="w-24 text-right">
+                    <div className="font-mono text-sm tabular-nums">
+                      <span className="text-success">{insp.approved}P</span>{" "}
+                      <span className="text-destructive">{insp.rejected}F</span>{" "}
+                      <span className="text-muted-foreground">/ {insp.total}</span>
+                    </div>
+                    <div className={cn("label-mono", idle ? "text-muted-foreground" : "")}>{idle ? "Idle" : `${insp.yieldPct.toFixed(0)}% yield`}</div>
+                  </div>
+                </div>
+              );
+            })
+          ) : (
+            <div className="py-8 text-center text-sm text-muted-foreground">No live inspector data yet.</div>
+          )}
+        </div>
+      </div>
+
+      <div className="surface p-5">
+        <div className="flex items-center justify-between">
+          <h3 className="font-semibold">Recent Live Queue</h3>
+          <span className="label-mono">{filteredDevices.length} of {liveDevices.length} total</span>
+        </div>
+        <div className="mt-4 divide-y divide-border">
+          {filteredDevices.length > 0 ? (
+            filteredDevices.slice(0, 8).map((device) => {
+              const inspectorLabel = device.inspectorId || "Unassigned";
+              return (
+                <div key={device.deviceId} className="flex items-center gap-4 py-3">
+                  <Avatar name={inspectorLabel} small />
+                  <div className={cn("flex h-7 items-center gap-1 rounded-full border px-2.5 label-mono", STATUS_BG[device.status])}>
+                    {device.status === "Approved" && <CheckCircle2 className="h-3 w-3" />}
+                    {device.status === "Rejected" && <XCircle className="h-3 w-3" />}
+                    {device.status === "Pending" && <RefreshCw className="h-3 w-3" />}
+                    {device.status === "In Progress" && <Activity className="h-3 w-3" />}
+                    {device.status}
+                  </div>
+                  <div className="min-w-[170px]">
+                    <div className="font-mono font-semibold">{device.deviceId}</div>
+                    <div className="label-mono">{device.qcType ?? "-"} · Slot {device.slot ?? "-"} · {device.version || "No version"}</div>
+                  </div>
+                  <div className="flex-1 text-sm">
+                    <div className="text-muted-foreground">
+                      {inspectorLabel} · <span className={STATUS_COLOR[device.status]}>{device.rejectionReason || device.remarks || "No remarks"}</span>
+                    </div>
+                  </div>
+                  <div className="text-right">
+                    <div className="font-mono text-sm tabular-nums">{formatTime(tsOf(device))}</div>
+                    <div className="label-mono inline-flex items-center gap-1">
+                      <Clock className="h-3 w-3" /> {Math.max(0, Math.round(durationOf(device, now) / 1000))}s
+                    </div>
+                  </div>
+                </div>
+              );
+            })
+          ) : (
+            <div className="py-8 text-center text-sm text-muted-foreground">
+              {liveDevices.length === 0 ? "No live queue data yet." : "No devices match the selected filters."}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function StatCard({ label, value, icon, note, valueClass }: { label: string; value: string | number; icon: ReactNode; note: string; valueClass?: string }) {
+  return (
+    <div className="surface p-4">
+      <div className="flex items-center justify-between">
+        <span className="label-mono">{label}</span>
+        {icon}
+      </div>
+      <div className={cn("stat-num mt-2", valueClass)}>{typeof value === "number" ? value.toString().padStart(2, "0") : value}</div>
+      <div className="label-mono mt-1 normal-case tracking-normal text-xs">{note}</div>
+    </div>
+  );
+}
+
+function PhaseCard({ title, subtitle, icon, stats }: { title: string; subtitle: string; icon: ReactNode; stats: { count: number; approved: number; rejected: number; open: number; avgMs: number } }) {
+  const yieldPct = stats.count ? (stats.approved / stats.count) * 100 : 0;
+  return (
+    <div className="surface p-5">
+      <div className="flex items-start justify-between">
+        <div className="flex items-center gap-3">
+          <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-secondary">{icon}</div>
+          <div>
+            <h3 className="font-semibold">{title}</h3>
+            <div className="text-xs text-muted-foreground">{subtitle}</div>
+          </div>
+        </div>
+        <div className="text-right">
+          <div className="stat-num text-info">{stats.count.toString().padStart(2, "0")}</div>
+          <div className="label-mono">Rows</div>
+        </div>
+      </div>
+      <div className="mt-4 h-1.5 flex w-full overflow-hidden rounded-full bg-muted">
+        <div className="h-full bg-success" style={{ width: `${stats.count ? (stats.approved / stats.count) * 100 : 0}%` }} />
+        <div className="h-full bg-warning" style={{ width: `${stats.count ? (stats.open / stats.count) * 100 : 0}%` }} />
+        <div className="h-full bg-destructive" style={{ width: `${stats.count ? (stats.rejected / stats.count) * 100 : 0}%` }} />
+      </div>
+      <div className="mt-2 flex justify-between text-xs font-mono tabular-nums">
+        <span>
+          <span className="text-success">{stats.approved}</span> <span className="label-mono">approved</span>
+        </span>
+        <span>
+          <span className="text-warning">{stats.open}</span> <span className="label-mono">open</span>
+        </span>
+        <span>
+          <span className="text-destructive">{stats.rejected}</span> <span className="label-mono">reject</span>
+        </span>
+      </div>
+      <div className="mt-4 grid grid-cols-2 border-t border-border pt-4">
+        <div>
+          <div className="label-mono">Yield</div>
+          <div className="mt-1 text-info font-mono text-lg tabular-nums">{yieldPct.toFixed(0)}%</div>
+        </div>
+        <div>
+          <div className="label-mono">Avg time</div>
+          <div className="mt-1 font-mono text-lg tabular-nums">{stats.count ? `${Math.round(stats.avgMs / 1000)}s` : "—"}</div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function YieldBar({ label, value, max, color }: { label: string; value: number; max: number; color: string }) {
+  return (
+    <div className="flex items-center gap-3">
+      <span className="label-mono w-16">{label}</span>
+      <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-muted">
+        <div className={cn("h-full rounded-full", color)} style={{ width: `${max ? (value / max) * 100 : 0}%` }} />
+      </div>
+      <span className="w-8 text-right font-mono text-sm tabular-nums">{value}</span>
+    </div>
+  );
+}
+
+function Avatar({ name, highlighted, small }: { name: string; highlighted?: boolean; small?: boolean }) {
+  const initials = name
+    .split(" ")
+    .map((s) => s[0])
+    .join("")
+    .slice(0, 2)
+    .toUpperCase();
+
+  return (
+    <div
+      className={cn(
+        "flex shrink-0 items-center justify-center rounded-full bg-primary text-primary-foreground font-medium",
+        small ? "h-8 w-8 text-xs" : "h-10 w-10 text-sm",
+        highlighted && "ring-2 ring-info ring-offset-2 ring-offset-background"
+      )}
+    >
+      {initials || "--"}
+    </div>
+  );
+}
+
+function durationOf(row: DeviceRow, now: number) {
+  if (!row.startTime) return 0;
+  const end = row.endTime ?? (row.status === "In Progress" ? now : 0);
+  if (!end) return 0;
+  return Math.max(0, end - row.startTime);
+}
+
+function tsOf(row: DeviceRow) {
+  return row.actionAt ?? row.endTime ?? row.startTime ?? 0;
+}
+
+function formatTime(ts: number) {
+  if (!ts) return "—";
+  return new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
